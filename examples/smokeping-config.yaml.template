@@ -1,0 +1,11 @@
+---
+targets:
+- hosts:
+  {{- range .Nodes }}
+  {{with nodeIP . "InternalIP"}}- {{ . }}{{end}}
+  {{with nodeIP . "ExternalIP"}}- {{ . }}{{end}}
+  {{- end }}
+  interval: 1s # Duration, Default 1s.
+  network: ip4
+  protocol: icmp
+  size: 56
