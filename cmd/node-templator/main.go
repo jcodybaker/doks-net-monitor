@@ -146,7 +146,13 @@ func NewNodeTemplatingController(informerFactory informers.SharedInformerFactory
 	if err != nil {
 		return nil, fmt.Errorf("parsing template file: %w", err)
 	}
-	t = t.Templates()[1]
+	for _, tmpl := range t.Templates() {
+		if tmpl.Name() == "" {
+			continue
+		}
+		t = tmpl
+		break
+	}
 	nodeInformer := informerFactory.Core().V1().Nodes()
 
 	c := &NodeTemplatingController{
@@ -189,7 +195,7 @@ var (
 )
 
 func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "absolute path to the kubeconfig file")
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&templateFile, "template", "template.yaml", "absolute path to the template file")
 	flag.StringVar(&outFile, "out", "config.yaml", "absolute path to the output file")
 	flag.StringVar(&notifyProcess, "notify-process", "", "name of process to notify on update")
@@ -200,12 +206,16 @@ func main() {
 	logs.InitLogs()
 	defer logs.FlushLogs()
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfig != "" {
+		rules.ExplicitPath = kubeconfig
+	}
+	config := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
+	restConfig, err := config.ClientConfig()
 	if err != nil {
 		klog.Fatal(err)
 	}
-
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		klog.Fatal(err)
 	}

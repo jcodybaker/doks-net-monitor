@@ -1,0 +1,123 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: smokeping-prober
+  namespace: kube-prometheus-stack
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: smokeping-prober
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "watch", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: smokeping-prober
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: smokeping-prober
+subjects:
+- kind: ServiceAccount
+  name: smokeping-prober
+  namespace: kube-prometheus-stack
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smokeping-prober
+  namespace: kube-prometheus-stack
+data:
+  smokeping-config.yaml.template: |-
+    ---
+    targets:
+    - hosts:
+      {{- range .Nodes }}
+      {{with nodeIP . "InternalIP"}}- {{ . }}{{end}}
+      {{with nodeIP . "ExternalIP"}}- {{ . }}{{end}}
+      {{- end }}
+      interval: 1s # Duration, Default 1s.
+      network: ip4
+      protocol: icmp
+      size: 56
+
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: smokeping-prober
+  name: smokeping-prober
+  namespace: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: smokeping-prober
+  template:
+    metadata:
+      labels:
+        app: smokeping-prober
+    spec:
+      serviceAccount: smokeping-prober
+      serviceAccountName: smokeping-prober
+      containers:
+      - name: smokeping-prober
+        image: quay.io/superq/smokeping-prober:latest
+        command:
+        - /bin/sh
+        - -c 
+        - sleep 10 && /bin/smokeping_prober --config.file=/etc/smokeping-prober/config/smokeping-config.yaml
+        ports:
+        - containerPort: 9374
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 250m
+            memory: 512M
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /-/healthy
+            port: 9374
+            scheme: HTTP
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 15
+        volumeMounts:
+        - name: smokeping-prober-config
+          mountPath: /etc/smokeping-prober/config
+          readOnly: true
+      - name: node-templater
+        image: docker.io/cbaker090/k8s-node-templater:latest
+        imagePullPolicy: Always
+        args:
+        - -template=/etc/smokeping-prober/template/smokeping-config.yaml.template
+        - -out=/etc/smokeping-prober/config/smokeping-config.yaml
+        - -notify-process=smokeping_prober
+        resources:
+          limits:
+            cpu: 250m
+            memory: 512M
+        volumeMounts:
+        - name: smokeping-prober-template
+          mountPath: /etc/smokeping-prober/template
+          readOnly: true
+        - name: smokeping-prober-config
+          mountPath: /etc/smokeping-prober/config
+          readOnly: false
+      volumes:
+      - name: smokeping-prober-template
+        configMap:
+          name: smokeping-prober
+      - name: smokeping-prober-config
+        emptyDir: {}
