@@ -15,7 +15,9 @@ kubectl port-forward -n kube-prometheus-stack svc/kube-prometheus-stack-promethe
 1) Port Forward `kubectl port-forward -n kube-prometheus-stack svc/kube-prometheus-stack-grafana 8080:80`
 1) Login with admin username and password from above
 1) First time only: Import https://raw.githubusercontent.com/SuperQ/smokeping_prober/master/dashboard.json as dashboard (+ on top right -> import dashboard)
+1) First time only: Import https://grafana.com/grafana/dashboards/1860-node-exporter-full/
 1) http://localhost:8080/dashboards
+
 
 ## Tools
 
