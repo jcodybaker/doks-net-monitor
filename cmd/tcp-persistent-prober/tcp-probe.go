@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -61,10 +63,25 @@ func NewTCPMetrics(nodeName string) *TCPMetrics {
 	}
 }
 
+func (m *TCPMetrics) Register(reg prometheus.Registerer) error {
+	if err := reg.Register(m.ConnectCount); err != nil {
+		return err
+	}
+	if err := reg.Register(m.ProbeCount); err != nil {
+		return err
+	}
+	if err := reg.Register(m.ProbeLatencyHist); err != nil {
+		return err
+	}
+	return nil
+}
+
 type TCPTarget struct {
 	Addr string
 	uuid string
 	*TCPMetrics
+	stop  context.CancelFunc
+	mutex sync.Mutex
 }
 
 type Payload struct {
@@ -80,13 +97,27 @@ func NewTCPTarget(addr string, m *TCPMetrics) *TCPTarget {
 	}
 }
 
-func (t *TCPTarget) Run(ctx context.Context) error {
+func (t *TCPTarget) Run(ctx context.Context) {
+	t.mutex.Lock()
+	if t.stop != nil {
+		log.Ctx(ctx).Warn().Msg("tcp target already running")
+		t.mutex.Unlock()
+	}
+	ctx, stop := context.WithCancel(ctx)
+	t.stop = stop
+	t.mutex.Unlock()
+	defer func() {
+		stop()
+		t.mutex.Lock()
+		t.stop = nil
+		t.mutex.Unlock()
+	}()
 	for ctx.Err() == nil {
 		conn, err := dialer.DialContext(ctx, "tcp", t.Addr)
 		if err != nil {
 			if ctx.Err() != nil {
 				// If the parent ctx is cancelled we should ignore whatever error dial gives us.
-				return nil
+				return
 			}
 			t.ConnectCount.With(prometheus.Labels{
 				"target":  t.Addr,
@@ -102,7 +133,15 @@ func (t *TCPTarget) Run(ctx context.Context) error {
 		}).Inc()
 		t.probe(ctx, conn)
 	}
-	return nil
+	return
+}
+
+func (t *TCPTarget) Stop() {
+	t.mutex.Lock()
+	if t.stop != nil {
+		t.stop()
+	}
+	t.mutex.Unlock()
 }
 
 func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
