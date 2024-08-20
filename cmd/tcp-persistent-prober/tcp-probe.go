@@ -272,7 +272,7 @@ func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		if metadata.RemoteNode == "" || metadata.RemotePod == "" {
+		if (metadata.RemoteNode == "" || metadata.RemotePod == "") && (resp.NodeName != "" || resp.PodName != "") {
 			// The remote provided this info. It's only valid for this connection so we only write to the metadata
 			// var in this scope (not on the receiver).
 			metadata.RemoteNode = resp.NodeName
@@ -295,7 +295,14 @@ func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
 			"outcome":     "success",
 			"error":       "",
 		}).Inc()
-		t.ProbeLatencyHist.With(prometheus.Labels{"target": t.Addr}).Observe(latency.Seconds())
+		t.ProbeLatencyHist.With(prometheus.Labels{
+			"target":      t.Addr,
+			"target_node": metadata.RemoteNode,
+			"target_pod":  metadata.RemotePod,
+			"target_type": metadata.TargetType,
+			"local_node":  metadata.LocalNode,
+			"local_pod":   metadata.LocalPod,
+		}).Observe(latency.Seconds())
 		if resp.Hangup {
 			// Remote indicated they're hanging up.  We're done.
 			log.Ctx(ctx).Info().Msg("remote signalled hangup; closing connection")

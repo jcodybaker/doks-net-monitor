@@ -13,7 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func StartEchoServer(ctx context.Context, addr string) (stop func(), err error) {
+func StartEchoServer(ctx context.Context, addr, nodeName, podName string) (stop func(), err error) {
 	ll := log.Ctx(ctx).With().Str("component", "echoserver").Logger()
 	ctx = ll.WithContext(ctx)
 	l, err := net.Listen("tcp", addr)
@@ -25,7 +25,7 @@ func StartEchoServer(ctx context.Context, addr string) (stop func(), err error) 
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		runEchoServer(ctx, l, &wg)
+		runEchoServer(ctx, l, &wg, nodeName, podName)
 	}()
 	return func() {
 		if err := l.Close(); err != nil {
@@ -36,7 +36,7 @@ func StartEchoServer(ctx context.Context, addr string) (stop func(), err error) 
 	}, nil
 }
 
-func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup) error {
+func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup, nodeName, podName string) error {
 	for ctx.Err() == nil {
 		conn, err := l.Accept()
 		if err != nil {
@@ -86,12 +86,14 @@ func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup) erro
 					if payload == nil {
 						// We'll get a nil payload when the channel is closed indicating the receive thread has exited.
 						// This could indicate that the ctx has been cancelled or that the connection was closed.
-						if err := encoder.Encode(&Payload{Hangup: true}); err != nil && !errors.Is(err, os.ErrClosed) {
+						if err := encoder.Encode(&Payload{Hangup: true, NodeName: nodeName, PodName: podName}); err != nil && !errors.Is(err, os.ErrClosed) {
 							ll.Err(err).Msg("sending hanging up payload")
 						}
 						return
 					}
 					payload.Hangup = ctx.Err() != nil
+					payload.NodeName = nodeName
+					payload.PodName = podName
 					if err := encoder.Encode(payload); err != nil {
 						ll.Err(err).Msg("error echoing payload; closing connection")
 						return

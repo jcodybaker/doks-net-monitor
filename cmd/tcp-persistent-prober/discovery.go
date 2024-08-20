@@ -62,6 +62,7 @@ func NewDiscovery(ctx context.Context, config DiscoveryConfig) (*Discovery, erro
 		svcInformer:       informerFactory.Core().V1().Services(),
 		endpointsInformer: informerFactory.Core().V1().Endpoints(),
 		log:               log.Ctx(ctx),
+		probes:            make(map[string]map[string]OnTargetRemove),
 	}
 	d.svcInformer.Informer().AddEventHandler(d)
 	d.endpointsInformer.Informer().AddEventHandler(d)
@@ -108,6 +109,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 	for _, svc := range svcs {
 		d.OnAdd(svc, false)
 	}
+	ll.Info().Msg("discovery has finished initialization")
 	return nil
 }
 
@@ -131,8 +133,10 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			}
 		}
 		if !match {
+			log.Trace().Str("svc", name).Msg("service does not match selectors")
 			return
 		}
+		log.Debug().Str("svc", name).Msg("service updated; adding targets")
 		d.mutex.Lock()
 		if _, ok := d.probes[name]; !ok {
 			d.probes[name] = make(map[string]OnTargetRemove)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -75,6 +76,7 @@ func main() {
 	}
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}).Level(logLevel)
 	ctx := context.Background()
+	ctx = log.Logger.WithContext(ctx)
 	var wg sync.WaitGroup
 
 	kubeconfig := viper.GetString("kubeconfig")
@@ -97,8 +99,9 @@ func main() {
 		var err error
 		node, err = clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
-			log.Fatal().Err(err).Msg("finding our node info")
+			log.Fatal().Err(err).Msg("finding local node info")
 		}
+		log.Debug().Str("node", node.Name).Msg("loaded local node info")
 	}
 	if node == nil {
 		log.Warn().Msg("NODE_NAME not set or node found")
@@ -109,16 +112,25 @@ func main() {
 		var err error
 		pod, err = clientset.CoreV1().Pods(podNamespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
-			log.Fatal().Err(err).Msg("finding our pod info")
+			log.Fatal().Err(err).Msg("finding local pod info")
 		}
+		log.Debug().Str("node", node.Name).Msg("loaded local pod info")
 	}
 
-	r := prometheus.NewRegistry()
-	http.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
-	tcpMetrics := NewTCPMetrics()
-	tcpMetrics.Register(prometheus.DefaultRegisterer)
+	sMux := http.NewServeMux()
 
-	stopEchoServer, err := StartEchoServer(ctx, viper.GetString("echo_bind_address"))
+	r := prometheus.NewRegistry()
+	sMux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
+	tcpMetrics := NewTCPMetrics()
+	tcpMetrics.Register(r)
+
+	echoServerAddr := viper.GetString("echo_bind_address")
+	log.Info().Str("bind_addr", echoServerAddr).Msg("starting echo server")
+	stopEchoServer, err := StartEchoServer(
+		ctx,
+		echoServerAddr,
+		viper.GetString("node_name"),
+		fmt.Sprintf("%s/%s", viper.GetString("pod_namespace"), viper.GetString("pod_name")))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to start echo server")
 	}
@@ -130,25 +142,46 @@ func main() {
 		LocalNode:                 node,
 		LocalPod:                  pod,
 		OnTargetAdd: func(target string, metadata TargetMetadata) OnTargetRemove {
+			log.Info().
+				Str("component", "discovery").
+				Str("target", target).
+				Str("target_type", metadata.TargetType).
+				Str("target_node", metadata.RemoteNode).
+				Str("target_pod", metadata.RemotePod).
+				Str("local_node", metadata.LocalNode).
+				Str("local_pod", metadata.LocalPod).
+				Msg("adding target")
 			p := NewTCPTarget(viper.GetDuration("probe_interval"), target, tcpMetrics, metadata)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				p.Run(ctx)
 			}()
-			return p.Stop
+			return func() {
+				log.Info().
+					Str("component", "discovery").
+					Str("target", target).
+					Str("target_type", metadata.TargetType).
+					Str("target_node", metadata.RemoteNode).
+					Str("target_pod", metadata.RemotePod).
+					Str("local_node", metadata.LocalNode).
+					Str("local_pod", metadata.LocalPod).
+					Msg("stopping target")
+				p.Stop()
+			}
 		},
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create discovery")
 	}
 
+	log.Info().Msg("starting discovery")
 	if err := discovery.Start(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to start discovery")
 	}
 
 	var shutdown int64
-	http.Handle("/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sMux.Handle("/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if atomic.LoadInt64(&shutdown) != 0 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -159,7 +192,7 @@ func main() {
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
-	http.Handle("/healthy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sMux.Handle("/healthy", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !discovery.Healthy() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -167,11 +200,13 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}))
 	s := http.Server{
-		Addr: ":9060",
+		Addr:    ":9060",
+		Handler: sMux,
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		log.Info().Str("bind_addr", s.Addr).Msg("starting metrics server")
 		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal().Err(err).Msg("failed to start HTTP server")
 		}
@@ -192,18 +227,21 @@ func main() {
 		if err := s.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error().Err(err).Msg("failed to shutdown HTTP server")
 		}
+		log.Info().Str("bind_addr", s.Addr).Msg("metrics server stopped")
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		discovery.Stop()
+		log.Info().Msg("discovery stopped")
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		stopEchoServer()
+		log.Info().Msg("echo server stopped")
 	}()
 
 	wg.Wait()
-
+	log.Info().Msg("shutdown complete")
 }
