@@ -80,18 +80,19 @@ func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup, node
 
 			var payload *Payload
 			encoder := json.NewEncoder(conn)
+		sendLoop:
 			for ctx.Err() == nil {
 				select {
 				case payload = <-payloadChan:
 					if payload == nil {
 						// We'll get a nil payload when the channel is closed indicating the receive thread has exited.
 						// This could indicate that the ctx has been cancelled or that the connection was closed.
-						if err := encoder.Encode(&Payload{Hangup: true, NodeName: nodeName, PodName: podName}); err != nil && !errors.Is(err, os.ErrClosed) {
-							ll.Err(err).Msg("sending hanging up payload")
-						}
-						return
+						break sendLoop
 					}
-					payload.Hangup = ctx.Err() != nil
+					if ctx.Err() != nil {
+						payload.Hangup = true
+						ll.Debug().Msg("sending hangup payload: shutdown signaled")
+					}
 					payload.NodeName = nodeName
 					payload.PodName = podName
 					if err := encoder.Encode(payload); err != nil {
@@ -103,12 +104,13 @@ func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup, node
 					}
 				case <-ctx.Done():
 					// Returning here will close the connection which should unwedge the receive thread.
-					return
+					break sendLoop
 				}
 			}
 			// The ctx has been cancelled indicating the server is shutting down. Send a hangup so the remote understands
 			// this is expected.
-			if err := encoder.Encode(&Payload{Hangup: true}); err != nil && !errors.Is(err, os.ErrClosed) {
+			ll.Debug().Msg("sending hangup payload: shutdown signaled")
+			if err := encoder.Encode(&Payload{Hangup: true, NodeName: nodeName, PodName: podName}); err != nil && !errors.Is(err, os.ErrClosed) {
 				ll.Err(err).Msg("sending hanging up payload")
 			}
 		}()

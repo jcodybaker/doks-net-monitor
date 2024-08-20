@@ -67,6 +67,7 @@ func init() {
 
 func main() {
 	flag.Parse()
+	start := time.Now()
 	logLevel, err := zerolog.ParseLevel(viper.GetString("log_level"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to parse log level")
@@ -196,7 +197,8 @@ func main() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		if !discovery.Healthy() {
+		discoveryStarted := time.Since(start) > (viper.GetDuration("discovery_start_delay") + (5 * time.Second))
+		if discoveryStarted && !discovery.Healthy() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
