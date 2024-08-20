@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"html/template"
 	"os"
@@ -15,12 +14,15 @@ import (
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	klog "k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/component-base/logs"
+
+	flag "github.com/spf13/pflag"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/shirou/gopsutil/v3/process"
 )
@@ -48,30 +50,33 @@ func (c *NodeTemplatingController) Run(stopCh chan struct{}) error {
 
 func (c *NodeTemplatingController) nodeAdd(obj interface{}) {
 	node := obj.(*v1.Node)
-	klog.Infof("NODE CREATED: %s/%s", node.Namespace, node.Name)
+	log.Info().Str("node", node.Name).
+		Str("node_phase", string(node.Status.Phase)).
+		Msg("node created")
 	c.render()
 }
 
 func (c *NodeTemplatingController) nodeUpdate(old, new interface{}) {
-	oldNode := old.(*v1.Node)
 	newNode := new.(*v1.Node)
-	klog.Infof(
-		"NODE UPDATED. %s/%s %s",
-		oldNode.Namespace, oldNode.Name, newNode.Status.Phase,
-	)
+	log.Info().
+		Str("node", newNode.Name).
+		Str("node_phase", string(newNode.Status.Phase)).
+		Msg("node updated")
 	c.render()
 }
 
 func (c *NodeTemplatingController) nodeDelete(obj interface{}) {
 	node := obj.(*v1.Node)
-	klog.Infof("NODE DELETED: %s/%s", node.Namespace, node.Name)
+	log.Info().
+		Str("node", node.Name).
+		Msg("node deleted")
 	c.render()
 }
 
 func (c *NodeTemplatingController) render() {
 	nodes, err := c.nodeInformer.Lister().List(labels.Everything())
 	if err != nil {
-		klog.Errorf("Failed to list nodes: %v", err)
+		log.Err(err).Msg("failed to list nodes")
 		return
 	}
 	sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
@@ -80,35 +85,36 @@ func (c *NodeTemplatingController) render() {
 	if err := c.template.Execute(b, struct {
 		Nodes []*v1.Node
 	}{Nodes: nodes}); err != nil {
-		klog.Errorf("Failed to render template: %v", err)
+		log.Err(err).Msg("failed to render template")
 		return
 	}
 
 	if bytes.Equal(b.Bytes(), c.lastContents) {
-		klog.Info("Template contents unchanged")
+		log.Debug().Msg("template contents unchanged")
 		return
 	}
 
+	ll := log.With().Str("output", outFile).Logger()
 	// Try to atomically swap the file by writing to a temp file and moving it into place.
 	dir := filepath.Dir(outFile)
 	file := filepath.Base(outFile)
 	f, err := os.CreateTemp(dir, file)
 	if err != nil {
-		klog.Errorf("Failed to create output file: %v", err)
+		ll.Err(err).Msg("failed to create output file")
 		return
 	}
 	defer f.Close()
 	if _, err := f.Write(b.Bytes()); err != nil {
-		klog.Errorf("Failed to write to output file: %v", err)
+		ll.Err(err).Msg("failed to write to output file")
 		return
 	}
 
 	if err := os.Rename(f.Name(), outFile); err != nil {
-		klog.Errorf("Failed to install output file: %v", err)
+		ll.Err(err).Msg("failed to install output file")
 		return
 	}
 	c.lastContents = b.Bytes()
-	klog.Infof("Rendered template to %s", outFile)
+	ll.Info().Msg("rendered template")
 	c.signal()
 }
 
@@ -118,22 +124,22 @@ func (c *NodeTemplatingController) signal() {
 	}
 	processes, err := process.Processes()
 	if err != nil {
-		klog.Errorf("Failed to list processes: %v", err)
+		log.Err(err).Msg("failed to list processes")
 		return
 	}
 	for _, p := range processes {
 		n, err := p.Name()
 		if err != nil {
-			klog.Errorf("Failed to fetch process name: %v", err)
+			log.Err(err).Msg("failed to fetch process name")
 			return
 		}
 		if n == notifyProcess {
 			err = p.SendSignal(syscall.SIGHUP)
 			if err != nil {
-				klog.Errorf("Failed to notify process %d: %v", p.Pid, err)
+				log.Err(err).Int("pid", int(p.Pid)).Msg("failed to notify process")
 				return
 			}
-			klog.Infof("Notified process %d", p.Pid)
+			log.Info().Int("pid", int(p.Pid)).Msg("notified process")
 		}
 	}
 }
@@ -199,12 +205,13 @@ func init() {
 	flag.StringVar(&templateFile, "template", "template.yaml", "absolute path to the template file")
 	flag.StringVar(&outFile, "out", "config.yaml", "absolute path to the output file")
 	flag.StringVar(&notifyProcess, "notify-process", "", "name of process to notify on update")
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}).Level(zerolog.DebugLevel)
+	zerolog.DurationFieldUnit = time.Second
+
 }
 
 func main() {
 	flag.Parse()
-	logs.InitLogs()
-	defer logs.FlushLogs()
 
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfig != "" {
@@ -213,24 +220,23 @@ func main() {
 	config := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{})
 	restConfig, err := config.ClientConfig()
 	if err != nil {
-		klog.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to build Kubernetes client config")
 	}
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		klog.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to build Kubernetes clientset")
 	}
 
 	factory := informers.NewSharedInformerFactory(clientset, time.Hour*24)
 	controller, err := NewNodeTemplatingController(factory, templateFile)
 	if err != nil {
-		klog.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to create node templating controller")
 	}
 
 	stop := make(chan struct{})
 	defer close(stop)
 	err = controller.Run(stop)
 	if err != nil {
-		klog.Fatal(err)
+		log.Fatal().Err(err).Msg("running node templating controller")
 	}
-	select {}
 }
