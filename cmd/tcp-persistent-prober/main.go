@@ -26,12 +26,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-var (
-	kubeconfig    string
-	svcSelectors  []string
-	probeInterval time.Duration
-)
-
 func init() {
 	viper.AutomaticEnv()
 
@@ -64,6 +58,9 @@ func init() {
 
 	flag.String("log-level", "info", "log level")
 	viper.BindPFlag("log_level", flag.Lookup("log-level"))
+
+	flag.Duration("discovery-start-delay", 15*time.Second, "delay before starting discovery")
+	viper.BindPFlag("discovery_start_delay", flag.Lookup("discovery-start-delay"))
 
 	zerolog.DurationFieldUnit = time.Second
 }
@@ -175,10 +172,23 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to create discovery")
 	}
 
-	log.Info().Msg("starting discovery")
-	if err := discovery.Start(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to start discovery")
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		delay := viper.GetDuration("discovery_start_delay")
+		if delay > 0 {
+			log.Info().Dur("delay", delay).Msg("waiting before starting discovery")
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+		}
+		log.Info().Msg("starting discovery")
+		if err := discovery.Start(ctx); err != nil {
+			log.Fatal().Err(err).Msg("failed to start discovery")
+		}
+	}()
 
 	var shutdown int64
 	sMux.Handle("/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

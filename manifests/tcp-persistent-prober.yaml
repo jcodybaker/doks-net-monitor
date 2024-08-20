@@ -102,6 +102,8 @@ spec:
           value: "9061"
         - name: LOG_LEVEL
           value: "debug"
+        - name: DISCOVERY_START_DELAY
+          value: "30s"
         - name: NODE_NAME
           valueFrom:
             fieldRef:
