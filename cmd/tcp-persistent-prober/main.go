@@ -12,6 +12,7 @@ import (
 	"time"
 
 	flag "github.com/spf13/pflag"
+	"github.com/spf13/viper"
 
 	"github.com/rs/zerolog/log"
 
@@ -25,22 +26,58 @@ import (
 )
 
 var (
-	kubeconfig   string
-	svcSelectors []string
+	kubeconfig    string
+	svcSelectors  []string
+	probeInterval time.Duration
 )
 
 func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
-	flag.StringArrayVar(&svcSelectors, "service-selector", nil, "service selector to probe")
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}).Level(zerolog.DebugLevel)
+	viper.AutomaticEnv()
+
+	flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	viper.BindPFlag("kubeconfig", flag.Lookup("kubeconfig"))
+
+	flag.StringArray("service-selector", nil, "service selector to probe")
+	viper.BindPFlag("service_selector", flag.Lookup("service-selector"))
+
+	flag.String("service-selector-namespace", "", "namespace of the service selector. If not set, all namespaces are used.")
+	viper.BindPFlag("service_selector_namespace", flag.Lookup("service-selector-namespace"))
+
+	flag.Duration("probe-interval", 1*time.Second, "interval between probes")
+	viper.BindPFlag("probe_interval", flag.Lookup("probe-interval"))
+
+	flag.String("echo-bind-address", ":9061", "address to bind echo server")
+	viper.BindPFlag("echo_bind_address", flag.Lookup("echo-bind-address"))
+
+	flag.String("metrics-bind-address", ":9060", "address to bind metrics server")
+	viper.BindPFlag("metrics_bind_address", flag.Lookup("metrics-bind-address"))
+
+	flag.String("node-name", "", "name of the node")
+	viper.BindPFlag("node_name", flag.Lookup("node-name"))
+
+	flag.String("pod-namespace", "", "namespace of the pod")
+	viper.BindPFlag("pod_namespace", flag.Lookup("pod-namespace"))
+
+	flag.String("pod-name", "", "name of the pod")
+	viper.BindPFlag("pod_name", flag.Lookup("pod-name"))
+
+	flag.String("log-level", "info", "log level")
+	viper.BindPFlag("log_level", flag.Lookup("log-level"))
+
 	zerolog.DurationFieldUnit = time.Second
 }
 
 func main() {
 	flag.Parse()
+	logLevel, err := zerolog.ParseLevel(viper.GetString("log_level"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to parse log level")
+	}
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}).Level(logLevel)
 	ctx := context.Background()
 	var wg sync.WaitGroup
 
+	kubeconfig := viper.GetString("kubeconfig")
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfig != "" {
 		rules.ExplicitPath = kubeconfig
@@ -56,7 +93,7 @@ func main() {
 	}
 
 	var node *v1.Node
-	if nodeName := os.Getenv("NODE_NAME"); nodeName != "" {
+	if nodeName := viper.GetString("node_name"); nodeName != "" {
 		var err error
 		node, err = clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
@@ -68,7 +105,7 @@ func main() {
 	}
 
 	var pod *v1.Pod
-	if podNamespace, podName := os.Getenv("POD_NAMESPACE"), os.Getenv("POD_NAME"); podNamespace != "" && podName != "" {
+	if podNamespace, podName := viper.GetString("pod_namespace"), viper.GetString("pod_name"); podNamespace != "" && podName != "" {
 		var err error
 		pod, err = clientset.CoreV1().Pods(podNamespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
@@ -81,18 +118,19 @@ func main() {
 	tcpMetrics := NewTCPMetrics()
 	tcpMetrics.Register(prometheus.DefaultRegisterer)
 
-	stopEchoServer, err := StartEchoServer(ctx, ":9061")
+	stopEchoServer, err := StartEchoServer(ctx, viper.GetString("echo_bind_address"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to start echo server")
 	}
 
 	discovery, err := NewDiscovery(ctx, DiscoveryConfig{
-		ServiceSelectors: svcSelectors,
-		ClientSet:        clientset,
-		LocalNode:        node,
-		LocalPod:         pod,
+		ServiceSelectors:          viper.GetStringSlice("service_selector"),
+		ServiceSelectorsNamespace: viper.GetString("service_selector_namespace"),
+		ClientSet:                 clientset,
+		LocalNode:                 node,
+		LocalPod:                  pod,
 		OnTargetAdd: func(target string, metadata TargetMetadata) OnTargetRemove {
-			p := NewTCPTarget(target, tcpMetrics, metadata)
+			p := NewTCPTarget(viper.GetDuration("probe_interval"), target, tcpMetrics, metadata)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()

@@ -24,11 +24,12 @@ type OnTargetAdd func(target string, metadata TargetMetadata) OnTargetRemove
 type OnTargetRemove func()
 
 type DiscoveryConfig struct {
-	ServiceSelectors []string
-	ClientSet        *kubernetes.Clientset
-	OnTargetAdd      OnTargetAdd
-	LocalNode        *v1.Node
-	LocalPod         *v1.Pod
+	ServiceSelectors          []string
+	ServiceSelectorsNamespace string
+	ClientSet                 *kubernetes.Clientset
+	OnTargetAdd               OnTargetAdd
+	LocalNode                 *v1.Node
+	LocalPod                  *v1.Pod
 }
 
 type Discovery struct {
@@ -50,7 +51,11 @@ type Discovery struct {
 func NewDiscovery(ctx context.Context, config DiscoveryConfig) (*Discovery, error) {
 	ll := log.Ctx(ctx).With().Str("component", "discovery").Logger()
 	ctx = ll.WithContext(ctx)
-	informerFactory := informers.NewSharedInformerFactory(config.ClientSet, time.Hour*24)
+	var informerOptions []informers.SharedInformerOption
+	if config.ServiceSelectorsNamespace != "" {
+		informerOptions = append(informerOptions, informers.WithNamespace(config.ServiceSelectorsNamespace))
+	}
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(config.ClientSet, 30*time.Minute, informerOptions...)
 	d := &Discovery{
 		DiscoveryConfig:   config,
 		informerFactory:   informerFactory,

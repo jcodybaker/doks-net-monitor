@@ -32,3 +32,13 @@ Building this tool requires [go](https://go.dev) and [ko](https://ko.build).
 ```
 KO_DOCKER_REPO=docker.io/cbaker090/k8s-node-templater ko build ./cmd/node-templator --bare --push
 ```
+
+### TCP Persistent Prober
+Tools like blackbox exporter establish a new TCP/HTTP connection for each probe. That type of monitoring is very useful for packet loss and latency monitoring. Kubernetes TCP service routing, however, features indirections which are not always obvious and depends upon stateful routing and rewriting. This tool aims to simluate long-lived connections leveraging Kubernetes service networking and monitors them for interruptions. Correlating this with data from kube-state-metrics and prometheus-node-exporter will hopefully allow us to diagnose any unexpected interruptions.
+
+
+#### Building
+Building this tool requires [go](https://go.dev) and [ko](https://ko.build).
+```
+KO_DOCKER_REPO=docker.io/cbaker090/tcp-persistent-prober ko build ./cmd/tcp-persistent-prober --bare --push
+```

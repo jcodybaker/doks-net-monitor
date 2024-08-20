@@ -100,7 +100,7 @@ type TargetMetadata struct {
 }
 
 // NewTCPTarget creates a new TCPTarget.
-func NewTCPTarget(addr string, m *TCPMetrics, metadata TargetMetadata) *TCPTarget {
+func NewTCPTarget(probeInterval time.Duration, addr string, m *TCPMetrics, metadata TargetMetadata) *TCPTarget {
 	return &TCPTarget{
 		Addr:       addr,
 		uuid:       uuid.New().String(),
