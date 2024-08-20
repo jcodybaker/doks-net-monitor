@@ -5,26 +5,30 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"k8s.io/client-go/tools/cache"
 )
 
-type OnTargetAdd func(target string) OnTargetRemove
+type OnTargetAdd func(target string, metadata TargetMetadata) OnTargetRemove
 
 type OnTargetRemove func()
 
 type DiscoveryConfig struct {
 	ServiceSelectors []string
-	InformerFactory  informers.SharedInformerFactory
+	ClientSet        *kubernetes.Clientset
 	OnTargetAdd      OnTargetAdd
-	NodeIP           string
+	LocalNode        *v1.Node
+	LocalPod         *v1.Pod
 }
 
 type Discovery struct {
@@ -34,13 +38,25 @@ type Discovery struct {
 	DiscoveryConfig
 	parsedServiceSelectors []labels.Selector
 	mutex                  sync.Mutex
+	informerFactory        informers.SharedInformerFactory
+	log                    *zerolog.Logger
+	nodeIP                 string
+	nodeName               string
+	podIP                  string
+	podName                string
+	ctx                    context.Context
 }
 
 func NewDiscovery(ctx context.Context, config DiscoveryConfig) (*Discovery, error) {
+	ll := log.Ctx(ctx).With().Str("component", "discovery").Logger()
+	ctx = ll.WithContext(ctx)
+	informerFactory := informers.NewSharedInformerFactory(config.ClientSet, time.Hour*24)
 	d := &Discovery{
 		DiscoveryConfig:   config,
-		svcInformer:       config.InformerFactory.Core().V1().Services(),
-		endpointsInformer: config.InformerFactory.Core().V1().Endpoints(),
+		informerFactory:   informerFactory,
+		svcInformer:       informerFactory.Core().V1().Services(),
+		endpointsInformer: informerFactory.Core().V1().Endpoints(),
+		log:               log.Ctx(ctx),
 	}
 	d.svcInformer.Informer().AddEventHandler(d)
 	d.endpointsInformer.Informer().AddEventHandler(d)
@@ -51,20 +67,35 @@ func NewDiscovery(ctx context.Context, config DiscoveryConfig) (*Discovery, erro
 		}
 		d.parsedServiceSelectors = append(d.parsedServiceSelectors, s)
 	}
+	if config.LocalPod != nil {
+		d.podName = fmt.Sprintf("%s/%s", config.LocalPod.Namespace, config.LocalPod.Name)
+		d.podIP = config.LocalPod.Status.PodIP
+	}
+	if config.LocalNode != nil {
+		d.nodeName = config.LocalNode.Name
+		for _, addr := range config.LocalNode.Status.Addresses {
+			if addr.Type == v1.NodeExternalIP {
+				d.nodeIP = addr.Address
+				break
+			}
+		}
+	}
 	return d, nil
 }
 
 // Run starts shared informers and waits for the shared informer cache to
 // synchronize.
 func (d *Discovery) Start(ctx context.Context) error {
+	ll := log.Ctx(ctx).With().Str("component", "echoserver").Logger()
+	ctx = ll.WithContext(ctx)
+	d.ctx = ctx
+	d.informerFactory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), d.endpointsInformer.Informer().HasSynced) {
 		return fmt.Errorf("failed to sync svc informer")
 	}
-	// wait for the initial synchronization of the local cache.
 	if !cache.WaitForCacheSync(ctx.Done(), d.svcInformer.Informer().HasSynced) {
 		return fmt.Errorf("failed to sync svc informer")
 	}
-	// We need to force a resync of the services as the endpoints informer may not have sync'ed as services were added.
 	svcs, err := d.svcInformer.Lister().List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list services: %v", err)
@@ -73,6 +104,15 @@ func (d *Discovery) Start(ctx context.Context) error {
 		d.OnAdd(svc, false)
 	}
 	return nil
+}
+
+func (d *Discovery) Stop() {
+	d.informerFactory.Shutdown()
+}
+
+func (d *Discovery) Healthy() bool {
+	return d.endpointsInformer.Informer().HasSynced() &&
+		d.svcInformer.Informer().HasSynced()
 }
 
 func (d *Discovery) OnAdd(obj interface{}, _ bool) {
@@ -96,7 +136,12 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			for _, port := range obj.Spec.Ports {
 				target := fmt.Sprintf("%s:%d", ip, port.Port)
 				if _, ok := d.probes[name][target]; !ok {
-					d.probes[name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target)
+					d.probes[name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target, TargetMetadata{
+						// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
+						TargetType: "ClusterIP",
+						LocalNode:  d.nodeName,
+						LocalPod:   d.podName,
+					})
 				}
 			}
 		}
@@ -104,9 +149,15 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			if port.NodePort == 0 {
 				continue
 			}
-			target := fmt.Sprintf("%s:%d", d.NodeIP, port.NodePort)
+			// This always targets the local NodePort, but may route to a pod on a different node.
+			target := fmt.Sprintf("%s:%d", d.nodeIP, port.NodePort)
 			if _, ok := d.probes[name][target]; !ok {
-				d.probes[name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target)
+				d.probes[name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target, TargetMetadata{
+					// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
+					TargetType: "NodePort",
+					LocalNode:  d.nodeName,
+					LocalPod:   d.podName,
+				})
 			}
 		}
 		d.mutex.Unlock()
@@ -129,13 +180,19 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
 					if _, ok := d.probes[name][target]; !ok {
-						d.probes[name][target] = d.OnTargetAdd(target)
+						d.probes[name][target] = d.OnTargetAdd(target, TargetMetadata{
+							RemoteNode: valueOrEmpty(addr.NodeName),
+							RemotePod:  podFromObjectRef(addr.TargetRef),
+							TargetType: "Pod",
+							LocalNode:  d.nodeName,
+							LocalPod:   d.podName,
+						})
 					}
 				}
 			}
 		}
 	default:
-		log.Warn().Type("informer_type", obj).Msg("unexpected object type")
+		d.log.Warn().Type("informer_type", obj).Msg("unexpected object type")
 	}
 }
 
@@ -156,20 +213,26 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 		}
 	case *v1.Endpoints:
 		name := fmt.Sprintf("%s/%s", obj.Namespace, obj.Name)
-		newTargets := make(map[string]struct{})
+		newTargets := make(map[string]TargetMetadata)
 		for _, es := range obj.Subsets {
 			for _, addr := range es.Addresses {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
-					newTargets[target] = struct{}{}
+					newTargets[target] = TargetMetadata{
+						RemoteNode: valueOrEmpty(addr.NodeName),
+						RemotePod:  podFromObjectRef(addr.TargetRef),
+						TargetType: "Pod",
+						LocalNode:  d.nodeName,
+						LocalPod:   d.podName,
+					}
 				}
 			}
 		}
 		d.mutex.Lock()
 		defer d.mutex.Unlock()
-		for target := range newTargets {
+		for target, metadata := range newTargets {
 			if _, ok := d.probes[name][target]; !ok {
-				d.probes[name][target] = d.OnTargetAdd(target)
+				d.probes[name][target] = d.OnTargetAdd(target, metadata)
 			}
 		}
 		for target := range d.probes[name] { // remove stale targets
@@ -183,7 +246,7 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 			}
 		}
 	default:
-		log.Warn().Type("informer_type", obj).Msg("unexpected object type")
+		d.log.Warn().Type("informer_type", obj).Msg("unexpected object type")
 	}
 }
 
@@ -198,7 +261,7 @@ func (d *Discovery) OnDelete(obj interface{}) {
 			return
 		}
 		for target, stop := range probes {
-			log.Info().Str("target", target).Str("svc", name).Msg("removing target")
+			d.log.Info().Str("target", target).Str("svc", name).Msg("removing target")
 			stop()
 			delete(probes, target)
 		}
@@ -210,8 +273,22 @@ func (d *Discovery) OnDelete(obj interface{}) {
 		})
 
 	default:
-		log.Warn().Type("informer_type", obj).Msg("unexpected object type")
+		d.log.Warn().Type("informer_type", obj).Msg("unexpected object type")
 		return
 	}
 
+}
+
+func valueOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func podFromObjectRef(ref *v1.ObjectReference) string {
+	if ref == nil || ref.Kind != "Pod" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s", ref.Namespace, ref.Name)
 }

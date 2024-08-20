@@ -2,41 +2,114 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/rs/zerolog/log"
 )
 
-func EchoServer(ctx context.Context, addr string) error {
+func StartEchoServer(ctx context.Context, addr string) (stop func(), err error) {
+	ll := log.Ctx(ctx).With().Str("component", "echoserver").Logger()
+	ctx = ll.WithContext(ctx)
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("opening listener: %w", err)
+		return nil, fmt.Errorf("opening listener: %w", err)
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		runEchoServer(ctx, l, &wg)
+	}()
+	return func() {
+		if err := l.Close(); err != nil {
+			ll.Warn().Err(err).Msg("closing listener")
+		}
+		cancel()
+		wg.Wait()
+	}, nil
+}
+
+func runEchoServer(ctx context.Context, l net.Listener, wg *sync.WaitGroup) error {
 	for ctx.Err() == nil {
 		conn, err := l.Accept()
 		if err != nil {
-			log.Err(err).Msg("accepting connection")
+			log.Ctx(ctx).Err(err).Msg("accepting connection")
 			continue
 		}
 
-		log := log.Ctx(ctx)
-		log.Debug().Msg("accepting connection")
-		wg.Add(1)
+		ll := log.Ctx(ctx).With().
+			Str("remote_addr", conn.RemoteAddr().String()).
+			Str("local_addr", conn.LocalAddr().String()).Logger()
+		ll.Info().Msg("accepting connection")
+		wg.Add(2)
+		payloadChan := make(chan *Payload)
 		go func() {
+			// receive thread
 			defer wg.Done()
-			defer conn.Close()
-			if _, err := io.Copy(conn, conn); err != nil {
-				log.Err(err).
-					Str("remote_addr", conn.RemoteAddr().String()).
-					Msg("proxying")
+			defer close(payloadChan)
+			decoder := json.NewDecoder(conn)
+
+			for ctx.Err() == nil {
+				payload := &Payload{}
+				if err := decoder.Decode(&payload); err != nil {
+					if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+						ll.Info().Msg("connection closed")
+						return
+					}
+					ll.Err(err).Msg("error decoding payload; closing connection")
+					return
+				}
+				payloadChan <- payload
 			}
-			log.Debug().Msg("closing connection")
+			ll.Debug().Msg("stopping receive thread: shutting down")
+		}()
+		go func() {
+			// send thread
+			defer wg.Done()
+			defer func() {
+				ll.Debug().Msg("closing connection")
+				conn.Close()
+			}()
+
+			var payload *Payload
+			encoder := json.NewEncoder(conn)
+			for ctx.Err() == nil {
+				select {
+				case payload = <-payloadChan:
+					if payload == nil {
+						// We'll get a nil payload when the channel is closed indicating the receive thread has exited.
+						// This could indicate that the ctx has been cancelled or that the connection was closed.
+						if err := encoder.Encode(&Payload{Hangup: true}); err != nil && !errors.Is(err, os.ErrClosed) {
+							ll.Err(err).Msg("sending hanging up payload")
+						}
+						return
+					}
+					payload.Hangup = ctx.Err() != nil
+					if err := encoder.Encode(payload); err != nil {
+						ll.Err(err).Msg("error echoing payload; closing connection")
+						return
+					}
+					if payload.Hangup {
+						return // We opportunitistically sent a hangup with the last response. Our work here is done.
+					}
+				case <-ctx.Done():
+					// Returning here will close the connection which should unwedge the receive thread.
+					return
+				}
+			}
+			// The ctx has been cancelled indicating the server is shutting down. Send a hangup so the remote understands
+			// this is expected.
+			if err := encoder.Encode(&Payload{Hangup: true}); err != nil && !errors.Is(err, os.ErrClosed) {
+				ll.Err(err).Msg("sending hanging up payload")
+			}
 		}()
 	}
-	wg.Wait()
 	return nil
 }

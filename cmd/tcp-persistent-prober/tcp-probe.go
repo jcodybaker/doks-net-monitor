@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
+	v1 "k8s.io/api/core/v1"
 )
 
 var (
@@ -30,37 +31,28 @@ type TCPMetrics struct {
 }
 
 // NewTCPMetrics creates a metrics root for TCPTarget probers.
-func NewTCPMetrics(nodeName string) *TCPMetrics {
+func NewTCPMetrics() *TCPMetrics {
 	return &TCPMetrics{
 		ConnectCount: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tcp_persistent_prober",
 			Subsystem: "connect",
 			Name:      "count",
 			Help:      "Total count of connect attempts by outcome.",
-			ConstLabels: prometheus.Labels{
-				"node": nodeName,
-			},
-		}, []string{"target", "outcome", "error"}),
+		}, []string{"target", "target_node", "target_pod", "target_type", "local_node", "local_pod", "outcome", "error"}),
 		ProbeCount: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tcp_persistent_prober",
 			Subsystem: "probe",
 			Name:      "count",
 			Help:      "Total count of probes by outcome.",
-			ConstLabels: prometheus.Labels{
-				"node": nodeName,
-			},
-		}, []string{"target", "outcome", "error"}),
+		}, []string{"target", "target_node", "target_pod", "target_type", "local_node", "local_pod", "outcome", "error"}),
 		ProbeLatencyHist: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Namespace: "tcp_persistent_prober",
 				Subsystem: "probe",
 				Name:      "latency",
 				Help:      "Latency of probes.",
-				ConstLabels: prometheus.Labels{
-					"node": nodeName,
-				},
-				Buckets: prometheus.DefBuckets,
-			}, []string{"target"},
+				Buckets:   prometheus.DefBuckets,
+			}, []string{"target", "target_node", "target_pod", "target_type", "local_node", "local_pod"},
 		),
 	}
 }
@@ -83,35 +75,61 @@ type TCPTarget struct {
 	Addr string
 	uuid string
 	*TCPMetrics
-	stop  context.CancelFunc
-	mutex sync.Mutex
+	stop      context.CancelFunc
+	mutex     sync.Mutex
+	localNode *v1.Node
+	localPod  *v1.Pod
+	metadata  TargetMetadata
 }
 
 // Payload is the wire message transmitted by TCPTarget
 type Payload struct {
-	UUID   string `json:"uuid"`
-	Hangup bool   `json:"hangup,omitempty"`
+	UUID     string `json:"uuid"`
+	NodeName string `json:"node_name"`
+	PodName  string `json:"pod_name"`
+	Payload  string `json:"payload"`
+	Hangup   bool   `json:"hangup,omitempty"`
+}
+
+type TargetMetadata struct {
+	RemoteNode string
+	RemotePod  string
+	TargetType string
+	LocalNode  string
+	LocalPod   string
 }
 
 // NewTCPTarget creates a new TCPTarget.
-func NewTCPTarget(addr string, m *TCPMetrics) *TCPTarget {
+func NewTCPTarget(addr string, m *TCPMetrics, metadata TargetMetadata) *TCPTarget {
 	return &TCPTarget{
 		Addr:       addr,
 		uuid:       uuid.New().String(),
 		TCPMetrics: m,
+		metadata:   metadata,
 	}
 }
 
 func (t *TCPTarget) Run(ctx context.Context) {
+	ll := log.Ctx(ctx).With().
+		Str("component", "probe").
+		Str("target", t.Addr).
+		Str("target_type", t.metadata.TargetType).
+		Str("target_node", t.metadata.RemoteNode).
+		Str("target_pod", t.metadata.RemotePod).
+		Str("local_node", t.metadata.LocalNode).
+		Str("local_pod", t.metadata.LocalPod).
+		Logger()
+	ctx = ll.WithContext(ctx)
 	t.mutex.Lock()
 	if t.stop != nil {
-		log.Ctx(ctx).Warn().Msg("tcp target already running")
+		ll.Warn().Msg("tcp target already running")
 		t.mutex.Unlock()
 	}
 	ctx, stop := context.WithCancel(ctx)
 	t.stop = stop
 	t.mutex.Unlock()
 	defer func() {
+		ll.Info().Msg("stopping probes")
 		stop()
 		t.mutex.Lock()
 		t.stop = nil
@@ -122,23 +140,36 @@ func (t *TCPTarget) Run(ctx context.Context) {
 		if err != nil {
 			if ctx.Err() != nil {
 				// If the parent ctx is cancelled we should ignore whatever error dial gives us.
+				ll.Info().Msg("cancelling probe dial: shutting down")
 				return
 			}
 			t.ConnectCount.With(prometheus.Labels{
-				"target":  t.Addr,
-				"outcome": "error",
-				"error":   err.Error(),
+				"target":      t.Addr,
+				"target_node": t.metadata.RemoteNode,
+				"target_pod":  t.metadata.RemotePod,
+				"target_type": t.metadata.TargetType,
+				"local_node":  t.metadata.LocalNode,
+				"local_pod":   t.metadata.LocalPod,
+				"outcome":     "error",
+				"error":       err.Error(),
 			}).Inc()
+			ll.Err(err).Msg("connecting to remote")
 			continue
 		}
 		t.ConnectCount.With(prometheus.Labels{
-			"target":  t.Addr,
-			"outcome": "success",
-			"error":   "",
+			"target":      t.Addr,
+			"target_node": t.metadata.RemoteNode,
+			"target_pod":  t.metadata.RemotePod,
+			"target_type": t.metadata.TargetType,
+			"local_node":  t.metadata.LocalNode,
+			"local_pod":   t.metadata.LocalPod,
+			"outcome":     "success",
+			"error":       "",
 		}).Inc()
-		t.probe(ctx, conn)
+		ll = ll.With().Str("remote_addr", conn.RemoteAddr().String()).Str("local_addr", conn.LocalAddr().String()).Logger()
+		ll.Info().Msg("connected to remote")
+		t.probe(ll.WithContext(ctx), conn)
 	}
-	return
 }
 
 func (t *TCPTarget) Stop() {
@@ -150,11 +181,20 @@ func (t *TCPTarget) Stop() {
 }
 
 func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
+	// copy metadata since we may amend it based on data from the remote.  That is only valid for
+	// this connection so we don't want to modify the original metadata.
+	metadata := t.metadata
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	defer conn.Close()
 	j := json.NewEncoder(conn)
 	payload := &Payload{UUID: t.uuid}
+	if t.localNode != nil {
+		payload.NodeName = t.localNode.Name
+	}
+	if t.localPod != nil {
+		payload.PodName = t.localPod.Name
+	}
 	scanner := bufio.NewScanner(conn)
 	for ctx.Err() == nil {
 		var resp Payload
@@ -174,9 +214,14 @@ func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
 					return
 				}
 				t.ProbeCount.With(prometheus.Labels{
-					"target":  t.Addr,
-					"outcome": "write_error",
-					"error":   err.Error(),
+					"target":      t.Addr,
+					"target_node": metadata.RemoteNode,
+					"target_pod":  metadata.RemotePod,
+					"target_type": metadata.TargetType,
+					"local_node":  metadata.LocalNode,
+					"local_pod":   metadata.LocalPod,
+					"outcome":     "write_error",
+					"error":       err.Error(),
 				}).Inc()
 			}
 			return
@@ -185,41 +230,77 @@ func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				t.ProbeCount.With(prometheus.Labels{
-					"target":  t.Addr,
-					"outcome": "read_error",
-					"error":   err.Error(),
+					"target":      t.Addr,
+					"target_node": metadata.RemoteNode,
+					"target_pod":  metadata.RemotePod,
+					"target_type": metadata.TargetType,
+					"local_node":  metadata.LocalNode,
+					"local_pod":   metadata.LocalPod,
+					"outcome":     "read_error",
+					"error":       err.Error(),
 				}).Inc()
+				log.Ctx(ctx).Err(err).Msg("read error")
 				return
 			}
 			// Scanner.Err eats EOF assuming its just the end of the input, but we should never see an EOF w/o a hangup message
 			t.ProbeCount.With(prometheus.Labels{
-				"target":  t.Addr,
-				"outcome": "read_error",
-				"error":   io.EOF.Error(),
+				"target":      t.Addr,
+				"target_node": metadata.RemoteNode,
+				"target_pod":  metadata.RemotePod,
+				"target_type": metadata.TargetType,
+				"local_node":  metadata.LocalNode,
+				"local_pod":   metadata.LocalPod,
+				"outcome":     "read_error",
+				"error":       io.EOF.Error(),
 			}).Inc()
+			log.Ctx(ctx).Err(io.EOF).Msg("read error")
 			return
 		}
 
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
 			t.ProbeCount.With(prometheus.Labels{
-				"target":  t.Addr,
-				"outcome": "read_error",
-				"error":   fmt.Sprintf("parse error: %v", err),
+				"target":      t.Addr,
+				"target_node": metadata.RemoteNode,
+				"target_pod":  metadata.RemotePod,
+				"target_type": metadata.TargetType,
+				"local_node":  metadata.LocalNode,
+				"local_pod":   metadata.LocalPod,
+				"outcome":     "read_error",
+				"error":       fmt.Sprintf("parse error: %v", err),
 			}).Inc()
+			log.Ctx(ctx).Err(err).Msg("parse error")
 			return
 		}
-		if resp.Hangup {
-			// Remote indicated they're hanging up.  We're done.
-			return
+
+		if metadata.RemoteNode == "" || metadata.RemotePod == "" {
+			// The remote provided this info. It's only valid for this connection so we only write to the metadata
+			// var in this scope (not on the receiver).
+			metadata.RemoteNode = resp.NodeName
+			metadata.RemotePod = resp.PodName
+			ctx = log.Ctx(ctx).With().
+				Str("target_node", metadata.RemoteNode).
+				Str("target_pod", metadata.RemotePod).
+				Logger().WithContext(ctx)
+			log.Ctx(ctx).Info().Msg("remote identified")
 		}
 
 		latency := time.Since(start)
 		t.ProbeCount.With(prometheus.Labels{
-			"target":  t.Addr,
-			"outcome": "success",
-			"error":   "",
+			"target":      t.Addr,
+			"target_node": metadata.RemoteNode,
+			"target_pod":  metadata.RemotePod,
+			"target_type": metadata.TargetType,
+			"local_node":  metadata.LocalNode,
+			"local_pod":   metadata.LocalPod,
+			"outcome":     "success",
+			"error":       "",
 		}).Inc()
 		t.ProbeLatencyHist.With(prometheus.Labels{"target": t.Addr}).Observe(latency.Seconds())
+		if resp.Hangup {
+			// Remote indicated they're hanging up.  We're done.
+			log.Ctx(ctx).Info().Msg("remote signalled hangup; closing connection")
+			return
+		}
 
 		// Wait for next interval.
 		select {
