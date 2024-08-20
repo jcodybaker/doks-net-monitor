@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+		"github.com/rs/zerolog"
 )
 
 var (
@@ -25,6 +26,8 @@ var (
 
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}).Level(zerolog.DebugLevel)
+	zerolog.DurationFieldUnit = time.Second
 }
 
 func main() {

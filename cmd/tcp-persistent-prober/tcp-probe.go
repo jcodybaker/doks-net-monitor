@@ -22,12 +22,14 @@ var (
 	}
 )
 
+// TCPMetrics holds metrics roots for all probers in this process.
 type TCPMetrics struct {
 	ConnectCount     *prometheus.CounterVec
 	ProbeCount       *prometheus.CounterVec
 	ProbeLatencyHist *prometheus.HistogramVec
 }
 
+// NewTCPMetrics creates a metrics root for TCPTarget probers.
 func NewTCPMetrics(nodeName string) *TCPMetrics {
 	return &TCPMetrics{
 		ConnectCount: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -76,6 +78,7 @@ func (m *TCPMetrics) Register(reg prometheus.Registerer) error {
 	return nil
 }
 
+// TCPTarget connects to a TCP destination and pings on a regular interval, reporting statistics.
 type TCPTarget struct {
 	Addr string
 	uuid string
@@ -84,11 +87,13 @@ type TCPTarget struct {
 	mutex sync.Mutex
 }
 
+// Payload is the wire message transmitted by TCPTarget
 type Payload struct {
 	UUID   string `json:"uuid"`
 	Hangup bool   `json:"hangup,omitempty"`
 }
 
+// NewTCPTarget creates a new TCPTarget.
 func NewTCPTarget(addr string, m *TCPMetrics) *TCPTarget {
 	return &TCPTarget{
 		Addr:       addr,
@@ -160,7 +165,12 @@ func (t *TCPTarget) probe(ctx context.Context, conn net.Conn) {
 			if scanner.Scan() {
 				if err := json.Unmarshal(scanner.Bytes(), &resp); err == nil && resp.Hangup {
 					// Clean hangup from remote, no error.
-					// TODO - Sleep here?
+					select {
+					case <-ctx.Done():
+					case <-time.After(5 * time.Second):
+						// The remote is shutting down. It's likely its being terminated / replaced
+						// but it might take a few moments for the Kubernetes discover to catch-up.
+					}
 					return
 				}
 				t.ProbeCount.With(prometheus.Labels{
