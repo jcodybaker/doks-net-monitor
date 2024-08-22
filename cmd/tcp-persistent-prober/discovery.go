@@ -222,6 +222,12 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 		}
 	case *v1.Endpoints:
 		name := fmt.Sprintf("%s/%s", obj.Namespace, obj.Name)
+		d.mutex.Lock()
+		defer d.mutex.Unlock()
+		if _, ok := d.probes[name]; !ok {
+			// This service is not in the select set.
+			return
+		}
 		newTargets := make(map[string]TargetMetadata)
 		for _, es := range obj.Subsets {
 			for _, addr := range es.Addresses {
@@ -237,8 +243,6 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 				}
 			}
 		}
-		d.mutex.Lock()
-		defer d.mutex.Unlock()
 		for target, metadata := range newTargets {
 			if _, ok := d.probes[name][target]; !ok {
 				d.probes[name][target] = d.OnTargetAdd(target, metadata)
