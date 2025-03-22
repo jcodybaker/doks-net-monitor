@@ -12,6 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	dnsecho "github.com/jcodybaker/doks-net-monitor/pkg/dns-echo"
+	tcpecho "github.com/jcodybaker/doks-net-monitor/pkg/tcp-echo"
+	"github.com/jcodybaker/doks-net-monitor/pkg/types"
 	flag "github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
@@ -41,11 +44,20 @@ func init() {
 	flag.Duration("probe-interval", 1*time.Second, "interval between probes")
 	viper.BindPFlag("probe_interval", flag.Lookup("probe-interval"))
 
-	flag.String("echo-bind-address", ":9061", "address to bind echo server")
-	viper.BindPFlag("echo_bind_address", flag.Lookup("echo-bind-address"))
+	flag.String("tcp-echo-bind-address", ":9061", "address to bind TCP echo server")
+	viper.BindPFlag("tcp_echo_bind_address", flag.Lookup("tcp-echo-bind-address"))
+
+	flag.String("dns-echo-bind-address", ":53", "address to bind DNS echo server")
+	viper.BindPFlag("dns_echo_bind_address", flag.Lookup("dns-echo-bind-address"))
 
 	flag.String("metrics-bind-address", ":9060", "address to bind metrics server")
 	viper.BindPFlag("metrics_bind_address", flag.Lookup("metrics-bind-address"))
+
+	flag.Bool("dns-echo", true, "enable DNS echo server")
+	viper.BindPFlag("dns_echo", flag.Lookup("dns-echo"))
+
+	flag.Bool("tcp-echo", true, "enable TCP echo server")
+	viper.BindPFlag("tcp_echo", flag.Lookup("tcp-echo"))
 
 	flag.String("node-name", "", "name of the node")
 	viper.BindPFlag("node_name", flag.Lookup("node-name"))
@@ -119,18 +131,40 @@ func main() {
 
 	r := prometheus.NewRegistry()
 	sMux.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
-	tcpMetrics := NewTCPMetrics()
-	tcpMetrics.Register(r)
 
-	echoServerAddr := viper.GetString("echo_bind_address")
-	log.Info().Str("bind_addr", echoServerAddr).Msg("starting echo server")
-	stopEchoServer, err := StartEchoServer(
-		ctx,
-		echoServerAddr,
-		viper.GetString("node_name"),
-		fmt.Sprintf("%s/%s", viper.GetString("pod_namespace"), viper.GetString("pod_name")))
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to start echo server")
+	var stop []func()
+	tcpMetrics := tcpecho.NewTCPMetrics()
+	tcpEchoEnabled := viper.GetBool("tcp_echo")
+	if tcpEchoEnabled {
+		tcpMetrics.Register(r)
+		echoServerAddr := viper.GetString("tcp_echo_bind_address")
+		log.Info().Str("bind_addr", echoServerAddr).Msg("starting TCP echo server")
+		stopEchoServer, err := tcpecho.StartEchoServer(
+			ctx,
+			echoServerAddr,
+			viper.GetString("node_name"),
+			fmt.Sprintf("%s/%s", viper.GetString("pod_namespace"), viper.GetString("pod_name")))
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to start TCP echo server")
+		}
+		stop = append(stop, stopEchoServer)
+	}
+	dnsMetrics := dnsecho.NewDNSClientMetrics()
+	dnsEchoEnabled := viper.GetBool("dns_echo")
+	if dnsEchoEnabled {
+		dnsMetrics.Register(r)
+		echoServerAddr := viper.GetString("dns_echo_bind_address")
+		log.Info().Str("bind_addr", echoServerAddr).Msg("starting DNS echo server")
+		s := dnsecho.NewServer(echoServerAddr)
+		s.Register(r)
+		if err := s.Start(); err != nil {
+			log.Fatal().Err(err).Msg("failed to start DNS echo server")
+		}
+		stop = append(stop, func() {
+			if err := s.Stop(ctx); err != nil {
+				log.Error().Err(err).Msg("failed to stop DNS echo server")
+			}
+		})
 	}
 
 	discovery, err := NewDiscovery(ctx, DiscoveryConfig{
@@ -139,33 +173,42 @@ func main() {
 		ClientSet:                 clientset,
 		LocalNode:                 node,
 		LocalPod:                  pod,
-		OnTargetAdd: func(target string, metadata TargetMetadata) OnTargetRemove {
-			log.Info().
+		OnTargetAdd: func(target string, metadata types.TargetMetadata) OnTargetRemove {
+			var stopProbe []func()
+			ll := log.With().
 				Str("component", "discovery").
 				Str("target", target).
 				Str("target_type", metadata.TargetType).
 				Str("target_node", metadata.RemoteNode).
 				Str("target_pod", metadata.RemotePod).
 				Str("local_node", metadata.LocalNode).
-				Str("local_pod", metadata.LocalPod).
-				Msg("adding target")
-			p := NewTCPTarget(viper.GetDuration("probe_interval"), target, tcpMetrics, metadata)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				p.Run(ctx)
-			}()
+				Str("local_pod", metadata.LocalPod).Logger()
+
+			if tcpEchoEnabled {
+				ll.Info().Msg("adding TCP target")
+				p := tcpecho.NewTCPTarget(viper.GetDuration("probe_interval"), target, tcpMetrics, metadata)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					p.Run(ctx)
+				}()
+				stopProbe = append(stopProbe, p.Stop)
+			}
+			if dnsEchoEnabled {
+				ll.Info().Msg("adding DNS target")
+				p := dnsecho.NewDNSTarget(viper.GetDuration("probe_interval"), target, dnsMetrics, metadata)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					p.Run(ctx)
+				}()
+				stopProbe = append(stopProbe, p.Stop)
+			}
 			return func() {
-				log.Info().
-					Str("component", "discovery").
-					Str("target", target).
-					Str("target_type", metadata.TargetType).
-					Str("target_node", metadata.RemoteNode).
-					Str("target_pod", metadata.RemotePod).
-					Str("local_node", metadata.LocalNode).
-					Str("local_pod", metadata.LocalPod).
-					Msg("stopping target")
-				p.Stop()
+				ll.Info().Msg("stopping target")
+				for _, stop := range stopProbe {
+					stop()
+				}
 			}
 		},
 	})
@@ -250,8 +293,10 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		stopEchoServer()
-		log.Info().Msg("echo server stopped")
+		for _, stop := range stop {
+			stop()
+		}
+		log.Info().Msg("echo servers stopped")
 	}()
 
 	wg.Wait()

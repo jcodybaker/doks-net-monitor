@@ -2,14 +2,14 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: tcp-persistent-prober
+  name: persistent-prober
   namespace: kube-prometheus-stack
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: tcp-persistent-prober
+  name: persistent-prober
 rules:
 - apiGroups: [""]
   resources: ["nodes"]
@@ -28,14 +28,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: tcp-persistent-prober
+  name: persistent-prober
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: tcp-persistent-prober
+  name: persistent-prober
 subjects:
 - kind: ServiceAccount
-  name: tcp-persistent-prober
+  name: persistent-prober
   namespace: kube-prometheus-stack
 
 ---
@@ -43,23 +43,23 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   labels:
-    app: tcp-persistent-prober
-  name: tcp-persistent-prober
+    app: persistent-prober
+  name: persistent-prober
   namespace: kube-prometheus-stack
 spec:
   selector:
     matchLabels:
-      app: tcp-persistent-prober
+      app: persistent-prober
   template:
     metadata:
       labels:
-        app: tcp-persistent-prober
+        app: persistent-prober
     spec:
-      serviceAccount: tcp-persistent-prober
-      serviceAccountName: tcp-persistent-prober
+      serviceAccount: persistent-prober
+      serviceAccountName: persistent-prober
       containers:
-      - name: tcp-persistent-prober
-        image: docker.io/cbaker090/tcp-persistent-prober:latest
+      - name: persistent-prober
+        image: docker.io/cbaker090/persistent-prober:latest
         ports:
         - containerPort: 9060
           protocol: TCP
@@ -67,6 +67,9 @@ spec:
         - containerPort: 9061
           protocol: TCP
           name: echo
+        - containerPort: 53
+          protocol: UDP
+          name: dns
         resources:
           limits:
             cpu: 250m
@@ -95,11 +98,13 @@ spec:
         - name: SERVICE_SELECTOR_NAMESPACE
           value: "kube-prometheus-stack"
         - name: SERVICE_SELECTOR
-          value: "app=tcp-persistent-prober"
-        - name: METRICS_PORT
-          value: "9060"
-        - name: ECHO_PORT
-          value: "9061"
+          value: "app=persistent-prober"
+        - name: METRICS_BIND_ADDRESS
+          value: ":9060"
+        - name: TCP_ECHO_BIND_ADDRESS
+          value: ":9061"
+        - name: DNS_ECHO_BIND_ADDRESS
+          value: ":53"
         - name: LOG_LEVEL
           value: "debug"
         - name: DISCOVERY_START_DELAY
@@ -123,8 +128,8 @@ apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: tcp-persistent-prober
-  name: tcp-persistent-prober
+    app: persistent-prober
+  name: persistent-prober
   namespace: kube-prometheus-stack
 spec:
   type: NodePort
@@ -134,7 +139,7 @@ spec:
     protocol: TCP
     targetPort: 9061
   selector:
-    app: tcp-persistent-prober
+    app: persistent-prober
 
 
 ---
@@ -143,7 +148,7 @@ kind: PodMonitor
 metadata:
   labels:
     release: kube-prometheus-stack
-  name: tcp-persistent-prober
+  name: persistent-prober
   namespace: kube-prometheus-stack
 spec:
   podMetricsEndpoints:
@@ -157,4 +162,4 @@ spec:
     - kube-prometheus-stack
   selector:
     matchLabels:
-      app: tcp-persistent-prober
+      app: persistent-prober

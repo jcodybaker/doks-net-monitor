@@ -1,4 +1,4 @@
-package main
+package tcpecho
 
 import (
 	"context"

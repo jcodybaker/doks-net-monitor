@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jcodybaker/doks-net-monitor/pkg/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -19,7 +20,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-type OnTargetAdd func(target string, metadata TargetMetadata) OnTargetRemove
+type OnTargetAdd func(target string, metadata types.TargetMetadata) OnTargetRemove
 
 type OnTargetRemove func()
 
@@ -145,7 +146,7 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			for _, port := range obj.Spec.Ports {
 				target := fmt.Sprintf("%s:%d", ip, port.Port)
 				if _, ok := d.probes[name][target]; !ok {
-					d.probes[name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target, TargetMetadata{
+					d.probes[name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target, types.TargetMetadata{
 						// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
 						TargetType: "ClusterIP",
 						LocalNode:  d.nodeName,
@@ -161,7 +162,7 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			// This always targets the local NodePort, but may route to a pod on a different node.
 			target := fmt.Sprintf("%s:%d", d.nodeIP, port.NodePort)
 			if _, ok := d.probes[name][target]; !ok {
-				d.probes[name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target, TargetMetadata{
+				d.probes[name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target, types.TargetMetadata{
 					// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
 					TargetType: "NodePort",
 					LocalNode:  d.nodeName,
@@ -189,7 +190,7 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
 					if _, ok := d.probes[name][target]; !ok {
-						d.probes[name][target] = d.OnTargetAdd(target, TargetMetadata{
+						d.probes[name][target] = d.OnTargetAdd(target, types.TargetMetadata{
 							RemoteNode: valueOrEmpty(addr.NodeName),
 							RemotePod:  podFromObjectRef(addr.TargetRef),
 							TargetType: "Pod",
@@ -228,12 +229,12 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 			// This service is not in the select set.
 			return
 		}
-		newTargets := make(map[string]TargetMetadata)
+		newTargets := make(map[string]types.TargetMetadata)
 		for _, es := range obj.Subsets {
 			for _, addr := range es.Addresses {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
-					newTargets[target] = TargetMetadata{
+					newTargets[target] = types.TargetMetadata{
 						RemoteNode: valueOrEmpty(addr.NodeName),
 						RemotePod:  podFromObjectRef(addr.TargetRef),
 						TargetType: "Pod",

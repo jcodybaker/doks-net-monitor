@@ -1,4 +1,4 @@
-package main
+package tcpecho
 
 import (
 	"bufio"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jcodybaker/doks-net-monitor/pkg/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
@@ -79,7 +80,7 @@ type TCPTarget struct {
 	mutex     sync.Mutex
 	localNode *v1.Node
 	localPod  *v1.Pod
-	metadata  TargetMetadata
+	metadata  types.TargetMetadata
 }
 
 // Payload is the wire message transmitted by TCPTarget
@@ -91,16 +92,8 @@ type Payload struct {
 	Hangup   bool   `json:"hangup,omitempty"`
 }
 
-type TargetMetadata struct {
-	RemoteNode string
-	RemotePod  string
-	TargetType string
-	LocalNode  string
-	LocalPod   string
-}
-
 // NewTCPTarget creates a new TCPTarget.
-func NewTCPTarget(probeInterval time.Duration, addr string, m *TCPMetrics, metadata TargetMetadata) *TCPTarget {
+func NewTCPTarget(probeInterval time.Duration, addr string, m *TCPMetrics, metadata types.TargetMetadata) *TCPTarget {
 	return &TCPTarget{
 		Addr:       addr,
 		uuid:       uuid.New().String(),
