@@ -20,7 +20,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-type OnTargetAdd func(target string, metadata types.TargetMetadata) OnTargetRemove
+type OnTargetAdd func(target string, portName string, metadata types.TargetMetadata) OnTargetRemove
 
 type OnTargetRemove func()
 
@@ -36,7 +36,7 @@ type DiscoveryConfig struct {
 type Discovery struct {
 	svcInformer       coreinformers.ServiceInformer
 	endpointsInformer coreinformers.EndpointsInformer
-	probes            map[string]map[string]OnTargetRemove
+	probes            map[string]map[string]map[string]OnTargetRemove
 	DiscoveryConfig
 	parsedServiceSelectors []labels.Selector
 	mutex                  sync.Mutex
@@ -63,7 +63,7 @@ func NewDiscovery(ctx context.Context, config DiscoveryConfig) (*Discovery, erro
 		svcInformer:       informerFactory.Core().V1().Services(),
 		endpointsInformer: informerFactory.Core().V1().Endpoints(),
 		log:               log.Ctx(ctx),
-		probes:            make(map[string]map[string]OnTargetRemove),
+		probes:            make(map[string]map[string]map[string]OnTargetRemove),
 	}
 	d.svcInformer.Informer().AddEventHandler(d)
 	d.endpointsInformer.Informer().AddEventHandler(d)
@@ -140,13 +140,16 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 		log.Debug().Str("svc", name).Msg("service updated; adding targets")
 		d.mutex.Lock()
 		if _, ok := d.probes[name]; !ok {
-			d.probes[name] = make(map[string]OnTargetRemove)
+			d.probes[name] = make(map[string]map[string]OnTargetRemove)
 		}
 		for _, ip := range obj.Spec.ClusterIPs {
 			for _, port := range obj.Spec.Ports {
+				if _, ok := d.probes[name][port.Name]; !ok {
+					d.probes[name][port.Name] = make(map[string]OnTargetRemove)
+				}
 				target := fmt.Sprintf("%s:%d", ip, port.Port)
-				if _, ok := d.probes[name][target]; !ok {
-					d.probes[name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target, types.TargetMetadata{
+				if _, ok := d.probes[name][port.Name][target]; !ok {
+					d.probes[name][port.Name][fmt.Sprintf("ClusterIP:%s", target)] = d.OnTargetAdd(target, port.Name, types.TargetMetadata{
 						// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
 						TargetType: "ClusterIP",
 						LocalNode:  d.nodeName,
@@ -161,8 +164,8 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			}
 			// This always targets the local NodePort, but may route to a pod on a different node.
 			target := fmt.Sprintf("%s:%d", d.nodeIP, port.NodePort)
-			if _, ok := d.probes[name][target]; !ok {
-				d.probes[name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target, types.TargetMetadata{
+			if _, ok := d.probes[name][port.Name][target]; !ok {
+				d.probes[name][port.Name][fmt.Sprintf("NodePort:%s", target)] = d.OnTargetAdd(target, port.Name, types.TargetMetadata{
 					// kube-proxy will randomly select an endpoint for this, so we cannot provide RemoteNode/RemotePod.
 					TargetType: "NodePort",
 					LocalNode:  d.nodeName,
@@ -189,8 +192,8 @@ func (d *Discovery) OnAdd(obj interface{}, _ bool) {
 			for _, addr := range es.Addresses {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
-					if _, ok := d.probes[name][target]; !ok {
-						d.probes[name][target] = d.OnTargetAdd(target, types.TargetMetadata{
+					if _, ok := d.probes[name][port.Name][target]; !ok {
+						d.probes[name][port.Name][target] = d.OnTargetAdd(target, port.Name, types.TargetMetadata{
 							RemoteNode: valueOrEmpty(addr.NodeName),
 							RemotePod:  podFromObjectRef(addr.TargetRef),
 							TargetType: "Pod",
@@ -229,12 +232,15 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 			// This service is not in the select set.
 			return
 		}
-		newTargets := make(map[string]types.TargetMetadata)
+		newTargets := make(map[string]map[string]types.TargetMetadata)
 		for _, es := range obj.Subsets {
 			for _, addr := range es.Addresses {
 				for _, port := range es.Ports {
 					target := fmt.Sprintf("%s:%d", addr.IP, port.Port)
-					newTargets[target] = types.TargetMetadata{
+					if _, ok := newTargets[port.Name]; !ok {
+						newTargets[port.Name] = make(map[string]types.TargetMetadata)
+					}
+					newTargets[port.Name][target] = types.TargetMetadata{
 						RemoteNode: valueOrEmpty(addr.NodeName),
 						RemotePod:  podFromObjectRef(addr.TargetRef),
 						TargetType: "Pod",
@@ -244,19 +250,26 @@ func (d *Discovery) OnUpdate(_, obj interface{}) {
 				}
 			}
 		}
-		for target, metadata := range newTargets {
-			if _, ok := d.probes[name][target]; !ok {
-				d.probes[name][target] = d.OnTargetAdd(target, metadata)
+		for portName, targets := range newTargets {
+			if _, ok := d.probes[name][portName]; !ok {
+				d.probes[name][portName] = make(map[string]OnTargetRemove)
+			}
+			for target, metadata := range targets {
+				if _, ok := d.probes[name][portName][target]; !ok {
+					d.probes[name][portName][target] = d.OnTargetAdd(target, portName, metadata)
+				}
 			}
 		}
-		for target := range d.probes[name] { // remove stale targets
-			if _, ok := newTargets[target]; !ok {
-				if strings.HasPrefix(target, "ClusterIP:") || strings.HasPrefix(target, "NodePort:") {
-					continue
+		for portName, targets := range d.probes[name] { // remove stale targets
+			for target := range targets {
+				if _, ok := newTargets[portName][target]; !ok {
+					if strings.HasPrefix(target, "ClusterIP:") || strings.HasPrefix(target, "NodePort:") {
+						continue
+					}
+					// Need to skip svc targets
+					d.probes[name][portName][target]()
+					delete(d.probes[name][portName], target)
 				}
-				// Need to skip svc targets
-				d.probes[name][target]()
-				delete(d.probes[name], target)
 			}
 		}
 	default:
@@ -274,10 +287,12 @@ func (d *Discovery) OnDelete(obj interface{}) {
 		if !ok {
 			return
 		}
-		for target, stop := range probes {
-			d.log.Info().Str("target", target).Str("svc", name).Msg("removing target")
-			stop()
-			delete(probes, target)
+		for portName, targets := range probes {
+			for target, stop := range targets {
+				d.log.Info().Str("target", target).Str("svc", name).Msg("removing target")
+				stop()
+				delete(probes[portName], target)
+			}
 		}
 		delete(d.probes, name)
 	case *v1.Endpoints:

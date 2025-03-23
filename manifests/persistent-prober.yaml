@@ -57,6 +57,16 @@ spec:
     spec:
       serviceAccount: persistent-prober
       serviceAccountName: persistent-prober
+      tolerations:
+      - key: "prober"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        doks.digitalocean.com/node-pool: pool
+      securityContext:
+        sysctls:
+        - name: "net.ipv4.ip_unprivileged_port_start"
+          value: "0"
       containers:
       - name: persistent-prober
         image: docker.io/cbaker090/persistent-prober:latest
@@ -133,11 +143,16 @@ metadata:
   namespace: kube-prometheus-stack
 spec:
   type: NodePort
+  externalTrafficPolicy: Local
   ports:
   - name: echo
     port: 9061
     protocol: TCP
     targetPort: 9061
+  - name: dns
+    port: 53
+    protocol: UDP
+    targetPort: 53
   selector:
     app: persistent-prober
 

@@ -173,7 +173,7 @@ func main() {
 		ClientSet:                 clientset,
 		LocalNode:                 node,
 		LocalPod:                  pod,
-		OnTargetAdd: func(target string, metadata types.TargetMetadata) OnTargetRemove {
+		OnTargetAdd: func(target string, portName string, metadata types.TargetMetadata) OnTargetRemove {
 			var stopProbe []func()
 			ll := log.With().
 				Str("component", "discovery").
@@ -184,7 +184,7 @@ func main() {
 				Str("local_node", metadata.LocalNode).
 				Str("local_pod", metadata.LocalPod).Logger()
 
-			if tcpEchoEnabled {
+			if tcpEchoEnabled && portName == "echo" {
 				ll.Info().Msg("adding TCP target")
 				p := tcpecho.NewTCPTarget(viper.GetDuration("probe_interval"), target, tcpMetrics, metadata)
 				wg.Add(1)
@@ -194,7 +194,9 @@ func main() {
 				}()
 				stopProbe = append(stopProbe, p.Stop)
 			}
-			if dnsEchoEnabled {
+			if dnsEchoEnabled && portName == "dns" &&
+				metadata.TargetType != "ClusterIP" &&
+				metadata.TargetType != "NodePort" {
 				ll.Info().Msg("adding DNS target")
 				p := dnsecho.NewDNSTarget(viper.GetDuration("probe_interval"), target, dnsMetrics, metadata)
 				wg.Add(1)

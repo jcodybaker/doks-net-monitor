@@ -27,7 +27,7 @@ func NewDNSClientMetrics() *DNSClientMetrics {
 	return &DNSClientMetrics{
 		probeOutcome: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "dns_echo_client",
-			Name:      "missing_requests_total",
+			Name:      "requests_total",
 			Help:      "Total number of requests arranged by outcome",
 		}, []string{"target", "target_node", "target_pod", "target_type", "local_node", "local_pod", "outcome", "error"}),
 		txLoss: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -148,6 +148,10 @@ func (t *DNSTarget) probe(ctx context.Context) {
 			{Name: t.probeClientID, Qtype: dns.TypeA, Qclass: dns.ClassINET},
 		},
 	}
+	// t.log.Debug().
+	// 	Uint16("probe_id", t.probeID).
+	// 	Str("probe_client_id", t.probeClientID).
+	// 	Msg("querying remote")
 	resp, rtt, err := t.dnsClient.ExchangeContext(ctx, req, t.Addr)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -187,9 +191,10 @@ func (t *DNSTarget) probe(ctx context.Context) {
 	}
 	if diff, _ := diffWithOverflow(t.probeID, uint16(resp.Answer[0].Header().Ttl)); diff > 1 {
 		t.log.Warn().
-			Uint16("diff", diff).
+			Uint16("diff", diff-1). // we only find about loss when a successful probe returns, sub 1 off for that packet
 			Uint16("client_id", req.Id).
 			Uint16("resp_last_id", uint16(resp.Answer[0].Header().Ttl)).
+			Str("probe_client_id", t.probeClientID).
 			Msg("tx loss detected")
 		t.txLoss.With(prometheus.Labels{
 			"target":      t.Addr,
@@ -207,6 +212,7 @@ func (t *DNSTarget) probe(ctx context.Context) {
 			Uint16("diff", diff).
 			Uint16("client_id", req.Id).
 			Uint16("resp_last_id", uint16(resp.Answer[0].Header().Ttl)).
+			Str("probe_client_id", t.probeClientID).
 			Msg("duplicate tx detected")
 		t.dupe.With(prometheus.Labels{
 			"target":      t.Addr,

@@ -82,7 +82,7 @@ func (m *Server) Register(reg prometheus.Registerer) error {
 }
 
 func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	if r.Question == nil || len(r.Question) == 0 {
+	if len(r.Question) == 0 {
 		return
 	}
 	s.mu.Lock()
